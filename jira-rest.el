@@ -153,7 +153,7 @@ value in .jira-auth-info.el.")
 
 (defvar response nil)
 
-(defun jira-rest-api-interact (method data &optional path)
+(defun jira-rest-api-interact (method data path output-func &optional wait limit)
   "Interact with the API using method 'method' and data 'data'.
 Optional arg 'path' may be provided to specify another location further
 down the URL structure to send the request."
@@ -165,18 +165,25 @@ down the URL structure to send the request."
              ("Authorization" . ,jira-rest-auth-info)))
           (url-request-data data)
           (target (concat jira-rest-endpoint path)))
-      (with-current-buffer (current-buffer)
-        (url-retrieve target 'my-switch-to-url-buffer `(,method))))))
+      (if wait
+          (with-current-buffer (url-retrieve-synchronously target)
+            (goto-char (point-min))
+            (my-switch-to-url-buffer nil `(,method ,output-func)))
+        (with-current-buffer (current-buffer)
+          (if limit
+              (url-queue-retrieve target 'my-switch-to-url-buffer `((,method ,output-func)))
+            (url-queue target 'my-switch-to-url-buffer `((,method ,output-func)))))))))
 
-(defun my-switch-to-url-buffer (status method)
+(defun my-switch-to-url-buffer (status cbargs)
   "Callback function to capture the contents of the response."
   (with-current-buffer (current-buffer)
     ;; Don't try to read the buffer if the method was DELETE,
     ;; since we won't get a response back.
-    (if (not (equal method "DELETE"))
+    (if (not (equal (car cbargs) "DELETE"))
         (let ((data (buffer-substring (search-forward-regexp "^$")
                                       (point-max))))
-          (setq response (json-read-from-string data))))
+          ;; (message "%s" data)
+          (funcall (cadr cbargs) (json-read-from-string data))))
     (kill-buffer (current-buffer))))
 
 (defun jira-rest-mode-quit ()
@@ -255,6 +262,45 @@ issueId or key."
       (puthash "name" name name-hash)
       (jira-rest-api-interact "PUT" (json-encode name-hash)
                               (concat k "/assignee")))))
+
+(defun jira-rest-reload-projects ()
+  "Reload all project to `jira-rest-projects-list'. Asynchronyously"
+  (interactive)
+  (let (projects-minimal)
+    (jira-rest-api-interact "GET" nil "project"
+                            (lambda (json)
+                              (setq projects-minimal json))
+                            t)
+    (setq jira-rest-projects-list (make-vector (length projects-minimal) nil))
+    (let ((index -1))
+      (dolist (key (mapcar (lambda (project)
+                             "fetch the `key' of a project"
+                             (cdr (assoc 'key project)))
+                           projects-minimal))
+        (lexical-let ((curr (incf index)))
+          (message "dolist: curr=%d key='%s'" curr key)
+          (jira-rest-api-interact "GET" nil (concat "project/" key)
+                                  (lambda (json)
+                                    (aset jira-rest-projects-list curr json)
+                                    (if (every #'(lambda (x) x) jira-rest-projects-list)
+                                        (message "Done")))
+                                  nil t)))
+      jira-rest-projects-list)))
+
+(defun jira-rest-get-projects ()
+  "Get list of all projects (`jira-rest-projects-list'). If not exist, fail"
+  (if (not jira-rest-projects-list)
+      (error "need to call `jira-rest-reload-projects' first!")
+    jira-rest-projects-list))
+
+(defun jira-rest-do-jql-search (jql)
+  "Get all issues according to `jql'."
+  (jira-rest-api-interact "POST"
+                          (json-encode `(:jql ,jql :startAt 0 :expand ,'("names") :fields ,'("*navigable" "comment")))
+                          "search"
+                          (lambda (json) (setq response json))
+                          t)
+  response)
 
 (provide 'jira-rest)
 ;;; jira-rest.el ends here
